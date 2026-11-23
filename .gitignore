@@ -18,6 +18,7 @@ electron/resources/cua-mac12/cua-driver-mac12
 electron/resources/OpenMausBot Recorder.app
 release
 .omb-scratch
+/shots/
 .wrangler/
 .dev.vars
 .dev.vars.*

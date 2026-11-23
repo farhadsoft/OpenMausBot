@@ -13,6 +13,7 @@ function nativeDesktopActions(platform) {
     appleMediaPermissions: appleNative,
     applePrivacySettings: appleNative,
     appleSpeech: appleNative,
+    windowsSpeech: normalizedPlatform(platform) === "win32",
   });
 }
 
@@ -65,6 +66,15 @@ function linuxLocalControlSupport(platform, env, { hyprlandPlugin } = {}) {
     reasonCode: "headless-session",
     message: "Local control needs an active Ubuntu Xorg desktop session.",
   });
+}
+
+/** macOS below 12.3 (Darwin before 21.4): no driver runs there — cua-driver needs 15 and the in-tree helper needs 12.3 — so
+ * it is never tried, and ask_for_computer can say why. */
+function macDriverUnsupported(platform, release) {
+  const [darwinMajor, darwinMinor = 0] = String(release).split(".").map(Number);
+  if (platform !== "darwin" || !darwinMajor) return null;
+  if (darwinMajor > 21 || (darwinMajor === 21 && darwinMinor >= 4)) return null;
+  return { reasonCode: "macos-version-unsupported", reason: "Local desktop control needs macOS 12.3 or later." };
 }
 
 /** Computer control's helper is gone, or the system refused to run it: access denied (os error 5), or Windows Security
@@ -137,12 +147,14 @@ function desktopCapabilities({
     screenPreview.reasonCode =
       hostPlatform === "linux" ? "headless-session" : "unsupported-platform";
   }
-  // Off the Mac the page listens itself and Fish Audio turns each clip into text (src/lib/fish-speech.ts).
-  const fishListening = hostPlatform === "win32" || hostPlatform === "linux";
+  // Windows listens through its own recognizer (speech-helper-windows.ps1). On Linux the page listens itself and Fish
+  // Audio turns each clip into text (src/lib/fish-speech.ts).
+  const isWindows = hostPlatform === "win32";
+  const fishListening = hostPlatform === "linux";
   const dictation = {
-    available: isMac || fishListening,
-    engine: isMac ? "apple-speech" : fishListening ? "fish-audio" : "none",
-    onDevice: isMac,
+    available: isMac || isWindows || fishListening,
+    engine: isMac ? "apple-speech" : isWindows ? "windows-speech" : fishListening ? "fish-audio" : "none",
+    onDevice: isMac || isWindows,
   };
   if (!dictation.available) dictation.reasonCode = "unsupported-platform";
   const localComputer = {
@@ -247,5 +259,6 @@ module.exports = {
   linuxLocalControlSupport,
   linuxSession,
   localComputerReady,
+  macDriverUnsupported,
   nativeDesktopActions,
 };

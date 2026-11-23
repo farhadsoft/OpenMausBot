@@ -34,6 +34,11 @@ describe("Mac local computer status", () => {
     expect(markup).not.toContain("Relaunch MausBot</button>");
   });
 
+  it("offers no permission repair on a Mac too old for the driver", () => {
+    fixture.localComputer = { available: false, status: "unavailable", reasonCode: "macos-version-unsupported", message: "Local desktop control needs macOS 13 Ventura or later." } as DesktopCapabilities["localComputer"];
+    expect(renderToStaticMarkup(createElement(MacLocalControl))).toBe("");
+  });
+
   it("names the macOS version a too-old Mac needs and offers no permission repair", () => {
     fixture.localComputer = { available: false, message: "computer use needs macOS 12.3 or later" } as DesktopCapabilities["localComputer"];
     const markup = renderToStaticMarkup(createElement(MacLocalControl));

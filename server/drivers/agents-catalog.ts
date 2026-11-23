@@ -7,11 +7,12 @@ import { agentToolAnnotations } from "../agent-tool-policy.ts";
 import { CHAT_CARD_TOOL_DEFINITIONS } from "./agents-chat-card-tools.ts";
 import { DEVS_TOOL_DEFINITIONS } from "./agents-devs-tools.ts";
 import { HELPER_TOOL_DEFINITIONS } from "./agents-helper-tools.ts";
+import { WHAT_CHANGED_TOOL_DEFINITION } from "./agents-what-changed-tool.ts";
 import { USAGE_LIMITS_TOOL_DEFINITION } from "./agents-usage-tool.ts";
 import { APP_SETTINGS_TOOL_DEFINITION } from "./agents-app-settings-tool.ts";
 import { THREAD_POST_TOOL_DEFINITION } from "./agents-thread-post-tool.ts";
 import { RENAME_THREAD_TOOL_DEFINITION } from "./agents-thread-title-tool.ts";
-import { WAIT_TOOL_DEFINITIONS, WAIT_TOOL_NAMES } from "./agents-wait-tools.ts";
+import { WAIT_TOOL_DEFINITIONS, WAIT_TOOL_NAMES } from "./agents-wait-tools.ts"; import { CHECK_BACK_TOOL_DEFINITIONS, CHECK_BACK_TOOL_NAMES } from "./agents-check-back-tool.ts";
 import { COMPUTER_ASK_TOOL_DEFINITIONS, COMPUTER_ASK_TOOL_NAMES } from "./agents-computer-ask-tool.ts";
 import { IMAGE_TOOL_DEFINITIONS, IMAGE_TOOL_NAMES } from "./agents-image-tools.ts";
 import { HOSTING_TOOL_DEFINITIONS, HOSTING_TOOL_NAMES } from "./agents-hosting-tools.ts";
@@ -300,7 +301,7 @@ const TOOL_DEFINITIONS = [
   {
     name: "vm_exec",
     description:
-      "Run a shell command inside your own Local VM (as the desktop user, starting in /home/cua/workspace) and get its exit code, stdout and stderr back as text. Use this for all command-line work in the VM: pip install --user, running a script, generating or converting a file, checking that a file exists. Do not type commands into a terminal window and read screenshots: that is slow and unreliable. GUI programs you start appear on the VM desktop. For a long job raise timeout_seconds (default 60, at most 300). Only available while you have a Local VM desktop.",
+      "Run a shell command inside your own Local VM or VPS desktop (as the desktop user, starting in /home/cua/workspace) and get its exit code, stdout and stderr back as text. Use this for all command-line work in the VM: pip install --user, running a script, generating or converting a file, checking that a file exists. Do not type commands into a terminal window and read screenshots: that is slow and unreliable. GUI programs you start appear on the VM desktop. For a long job raise timeout_seconds (default 60, at most 300). Only available on a Local VM or VPS desktop.",
     inputSchema: {
       type: "object",
       additionalProperties: false,
@@ -473,15 +474,17 @@ const TOOL_DEFINITIONS = [
   {
     name: "request_sign_in",
     description:
-      "Ask the person to sign in to a website themselves, in the browser or on the computer you are using now. Use it when a page needs a login you do not have, or a CAPTCHA, passkey or other step only they can do, or a one-time code you cannot read. A code the site sends to the person's own email or messages for a sign-in they asked for is not one: read it there and type it in yourself. They get a card and a notification, sign in where you work, and press Done. Never ask for a password or code in chat. After calling it, end your turn; OpenMausBot resumes you when they finish or decline, and then check you are signed in.",
+      "Hand one step to the person where you work: a sign-in you have no login for, a CAPTCHA, passkey, code you cannot read, payment details or approval only they can give. Ask only when really blocked, for the smallest step; they type any password, code or payment details themselves, never in chat. It returns at once: say you are waiting, then stop or do other work. It expires in 30 minutes; you are resumed with done, skipped or expired and their note. Done is unverified: re-read the page.",
     inputSchema: {
       type: "object",
       additionalProperties: false,
       properties: {
-        site: { type: "string", minLength: 1, maxLength: 2048, description: "The page to sign in on: its address, or the domain, such as example.com." },
-        reason: { type: "string", description: "One short sentence, in your words, on what the sign-in is for." },
+        instruction: { type: "string", minLength: 1, maxLength: 300, description: "One specific sentence, such as: Sign in to GitHub on the open page." },
+        kind: { type: "string", enum: ["sign_in", "captcha", "payment", "approval", "other"] },
+        target: { type: "string", enum: ["browser", "computer"] },
+        site: { type: "string", maxLength: 2048, description: "Address or domain, if not the open page." },
       },
-      required: ["site"],
+      required: ["instruction", "kind"],
     },
   },
   {
@@ -516,7 +519,7 @@ const TOOL_DEFINITIONS = [
       required: ["text"],
     },
   },
-  ...RESEARCH_TOOL_DEFINITIONS, ...HELPER_TOOL_DEFINITIONS, ...IMAGE_TOOL_DEFINITIONS, ...MEETING_TOOL_DEFINITIONS, ...PERSON_TOOL_DEFINITIONS, ...DEVS_TOOL_DEFINITIONS, ...HOSTING_TOOL_DEFINITIONS, ...SHARE_TOOL_DEFINITIONS,
+  ...RESEARCH_TOOL_DEFINITIONS, ...HELPER_TOOL_DEFINITIONS, WHAT_CHANGED_TOOL_DEFINITION, ...IMAGE_TOOL_DEFINITIONS, ...MEETING_TOOL_DEFINITIONS, ...PERSON_TOOL_DEFINITIONS, ...DEVS_TOOL_DEFINITIONS, ...HOSTING_TOOL_DEFINITIONS, ...SHARE_TOOL_DEFINITIONS,
   {
     name: "memory_update",
     description:
@@ -610,7 +613,7 @@ const TOOL_DEFINITIONS = [
   {
     name: "trigger",
     description:
-      "Set up or change an automation (a routine): when something happens, a bot does the instructions. Create it in this turn, without asking to confirm, whenever the person describes recurring or event-based work (\"every morning send me…\", \"whenever I get an email from…\", \"when another app calls…\"); something to do once, now, is not one. when=schedule runs on a time rule or cron (trigger_info first for the current time); app_event when a connected app's event happens (trigger_info action=events first; better than a schedule that keeps checking); webhook when another app calls its private address, which you may paste only into that app's setup; limit_reset when an AI's usage limit resets. update, pause, resume and run_now take a trigger_id from trigger_info. Pause a temporary monitor once its goal is met, then read it back; delete_trigger only at the person's request. To the person these are automations: write name and instructions as they would say them.",
+      "Set up or change an automation (a routine): when something happens, a bot does the instructions. Create it in this turn, without asking to confirm, whenever the person describes recurring or event-based work; something to do once, now, is not one, and a later look at this chat is check_back. when=schedule runs on a time rule or cron (trigger_info first for the current time); app_event when a connected app's event happens (trigger_info action=events first; better than a schedule that keeps checking); webhook when another app calls its private address, which you may paste only into that app's setup; limit_reset when an AI's usage limit resets. update, pause, resume and run_now take a trigger_id from trigger_info. Pause a temporary monitor once its goal is met, then read it back; delete_trigger only at the person's request. To the person these are automations: write name and instructions as they would say them.",
     inputSchema: {
       type: "object",
       additionalProperties: false,
@@ -644,6 +647,7 @@ const TOOL_DEFINITIONS = [
     },
   },
   ...WAIT_TOOL_DEFINITIONS,
+  ...CHECK_BACK_TOOL_DEFINITIONS,
   ...COMPUTER_ASK_TOOL_DEFINITIONS,
   {
     name: "propose_profile",
@@ -812,7 +816,7 @@ const WATCHER_TOOL_NAMES = new Set(["create_options_card"]);
 
 const LOCAL_VM_TOOL_NAMES = new Set(["vm_exec"]);
 /** Refused in a room's thread (routes/waits.ts), and list_waits, since a room holds no wait. */
-const ROOM_REFUSED_TOOL_NAMES = new Set([...WAIT_TOOL_NAMES, "burst", "rename_thread"]);
+const ROOM_REFUSED_TOOL_NAMES = new Set([...WAIT_TOOL_NAMES, ...CHECK_BACK_TOOL_NAMES, "burst", "rename_thread"]);
 const CLOUD_HOME_SURFACE = {
   type: "string", enum: ["auto", "cloud", "browser"],
   description: "auto = suitable configured computer, cloud = the bot's cloud computer, browser = built-in browser. Omit to list. This server runs in the cloud: the user's own computer and a Local VM are not places here.",
