@@ -221,6 +221,20 @@ jobs:
             echo "ok: $app"
           done
 
+      - name: "Gate: the bundled CUA SDK must load on macOS 12 and later"
+        run: |
+          for resources in \
+            "$PWD/release/mac-arm64/OpenMausBot.app/Contents/Resources" \
+            "$PWD/release/mac/OpenMausBot.app/Contents/Resources"; do
+            node scripts/cua-macos-backcompat.mjs --verify "$resources"
+          done
+          case "$(node -p process.arch)" in
+            arm64) resources="$PWD/release/mac-arm64/OpenMausBot.app/Contents/Resources" ;;
+            x64) resources="$PWD/release/mac/OpenMausBot.app/Contents/Resources" ;;
+            *) exit 1 ;;
+          esac
+          "$resources/cua-driver" --version
+
       - name: "Gate: signed native browser works with an empty home"
         run: |
           case "$(node -p process.arch)" in

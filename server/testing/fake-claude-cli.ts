@@ -7,6 +7,10 @@
 //   FAKE_CLAUDE_API_ERROR  text for the api-error frame (default: overloaded)
 //   FAKE_CLAUDE_API_ERROR_KIND  the api-error frame's `error` (default: unknown); FAKE_CLAUDE_API_ERROR_STATUS its result's
 //     api_error_status; FAKE_CLAUDE_NO_TERMINAL_REASON=1: the result has no terminal_reason, only stop_reason "stop_sequence"
+//   FAKE_CLAUDE_REFUSED_RESULTS  count (with FAKE_CLAUDE_STATE, which counts launches across processes): that many launches answer
+//     the api-error frames Claude Code 2.1.327 sends for a refused connection (`error: "server_error"`, "API Error: Connection
+//     refused …") and stay alive, as it does; FAKE_CLAUDE_API_ERROR and FAKE_CLAUDE_API_ERROR_KIND set them, FAKE_CLAUDE_PARTIAL_FAILS
+//     streams a text delta first
 //   FAKE_CLAUDE_RATE_LIMIT  JSON rate_limit_info reported in a `rate_limit_event` after init
 //   FAKE_CLAUDE_LIMITED_FILE  path: while it exists, every turn plays usage-limit with the file's JSON rate_limit_info
 //   FAKE_CLAUDE_MCP_FAILED  comma list of MCP servers init reports as failed (`mcp_servers`)
@@ -981,6 +985,28 @@ const playTurn = (prompt: JsonValue, late = false) => {
       if (process.env.FAKE_CLAUDE_ELICIT) out({ type: "control_request", request_id: "elicit-1", request: { subtype: "elicitation", ...JSON.parse(process.env.FAKE_CLAUDE_ELICIT) } });
       process.stderr.write("claude: API error (503): service temporarily unavailable\n");
       process.exit(5);
+    }
+  }
+  // FAKE_CLAUDE_REFUSED_RESULTS launches answer a connection-refused api-error result and stay alive, counted in the
+  // FAKE_CLAUDE_STATE file; FAKE_CLAUDE_PARTIAL_FAILS streams a text delta first (the never-replay guard).
+  if (process.env.FAKE_CLAUDE_REFUSED_RESULTS && process.env.FAKE_CLAUDE_STATE) {
+    let launched = 0;
+    try {
+      launched = Number(readFileSync(process.env.FAKE_CLAUDE_STATE, "utf8")) || 0;
+    } catch {}
+    const quota = Number(process.env.FAKE_CLAUDE_REFUSED_RESULTS) || 0;
+    writeFileSync(process.env.FAKE_CLAUDE_STATE, String(launched + 1));
+    out({ type: "system", subtype: "init", session_id: sessionId, model, permissionMode, tools, ...mcpStatus() });
+    if (launched < quota) {
+      if (process.env.FAKE_CLAUDE_PARTIAL_FAILS) {
+        out({ type: "stream_event", event: { type: "content_block_delta", delta: { type: "text_delta", text: "half an answer" } } });
+      }
+      const text = process.env.FAKE_CLAUDE_API_ERROR ?? "API Error: Connection refused \u2014 a firewall or proxy may be blocking it (ECONNREFUSED)";
+      out({ type: "assistant", message: { model: "<synthetic>", stop_reason: "stop_sequence", content: [{ type: "text", text }] }, error: process.env.FAKE_CLAUDE_API_ERROR_KIND ?? "server_error", is_api_error_message: true });
+      out({ type: "result", subtype: "success", is_error: true, stop_reason: "stop_sequence", terminal_reason: "api_error", result: text });
+      turnRunning = false;
+      finishIfDone();
+      return;
     }
   }
 

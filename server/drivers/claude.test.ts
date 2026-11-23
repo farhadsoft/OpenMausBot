@@ -554,6 +554,7 @@ describe("ClaudeDriver turns (fake CLI)", () => {
     delete process.env.FAKE_CLAUDE_ANSWERED_FAILS;
     delete process.env.FAKE_CLAUDE_STATE;
     delete process.env.FAKE_CLAUDE_RETRY_SCALE;
+    delete process.env.FAKE_CLAUDE_REFUSED_RESULTS;
     delete process.env.FAKE_CLAUDE_TEXT_HANG;
     delete process.env.FAKE_CLAUDE_STEER_GRACE_SCALE;
     delete process.env.FAKE_CLAUDE_STEER_SILENCE_SCALE;
@@ -3989,6 +3990,135 @@ describe("ClaudeDriver turns (fake CLI)", () => {
     expect(recorder.events.some((e) => e.type === "content.delta" && e.streamKind === "assistant_text")).toBe(true);
     expect(recorder.events.some((e) => e.type === "turn.retrying")).toBe(false);
   }, 20_000);
+
+  // The route a CLI's API calls take comes from the host's environment: pin it so these hold under a developer's proxy or gateway.
+  const directRoute = () => {
+    for (const name of ["HTTP_PROXY", "HTTPS_PROXY", "ALL_PROXY", "http_proxy", "https_proxy", "all_proxy", "NO_PROXY", "no_proxy",
+      "ANTHROPIC_BASE_URL", "CLAUDE_CODE_USE_BEDROCK", "CLAUDE_CODE_USE_VERTEX"]) vi.stubEnv(name, undefined);
+  };
+
+  it("ends a CLI that answered a connection refusal and sends the turn again on a fresh process", async () => {
+    const state = join(scratch, "refused-launches");
+    const dump = join(scratch, "refused-relaunch.json");
+    process.env.FAKE_CLAUDE_REFUSED_RESULTS = "1";
+    process.env.FAKE_CLAUDE_STATE = state;
+    process.env.FAKE_CLAUDE_RETRY_SCALE = "0.01";
+    process.env.FAKE_CLAUDE_DUMP = dump;
+    await create();
+    const dispatch = await instance.adapter.sendTurn({ threadId: "t-refused", text: "go" });
+
+    const completed = await recorder.until((e) => e.type === "turn.completed");
+    expect(completed).toMatchObject({ ok: true, turnId: dispatch.turnId });
+    expect(recorder.events.filter((e) => e.type === "turn.retrying")).toMatchObject([{ attempt: 1, reason: "connection_reset" }]);
+    expect(recorder.events.some((e) => e.type === "runtime.error"), "a refusal that is retried is not announced").toBe(false);
+    expect(readFileSync(state, "utf8")).toBe("2");
+    const first = recorder.events.find((e) => e.type === "session.started")!.sessionId;
+    const argv: string[] = JSON.parse(readFileSync(dump, "utf8")).argv;
+    expect(argv[argv.indexOf("--resume") + 1]).toBe(first);
+  }, 20_000);
+
+  it("reports a refusal that outlasts its retries once, with where the CLI was calling, and holds the engine unavailable until a turn gets through", async () => {
+    directRoute();
+    const state = join(scratch, "refused-launches-cap");
+    process.env.FAKE_CLAUDE_REFUSED_RESULTS = "9";
+    process.env.FAKE_CLAUDE_STATE = state;
+    process.env.FAKE_CLAUDE_RETRY_SCALE = "0.01";
+    await create();
+    await instance.adapter.sendTurn({ threadId: "t-refused-cap", text: "go" });
+
+    expect(await recorder.until((e) => e.type === "turn.completed")).toMatchObject({ ok: false, stopReason: "exit_before_result" });
+    expect(readFileSync(state, "utf8"), "the first launch and the two retries the cap allows").toBe("3");
+    expect(recorder.events.filter((e) => e.type === "turn.retrying").map((e) => e.attempt)).toEqual([1, 2]);
+    const errors = recorder.events.filter((e) => e.type === "runtime.error");
+    expect(errors).toHaveLength(1);
+    expect(errors[0].message).toMatch(/ECONNREFUSED.*Target: https:\/\/api\.anthropic\.com\. No proxy set\./);
+    expect(await instance.snapshot()).toMatchObject({ state: "unavailable", reason: expect.stringContaining("ECONNREFUSED") });
+
+    delete process.env.FAKE_CLAUDE_REFUSED_RESULTS;
+    await instance.adapter.sendTurn({ threadId: "t-refused-cap", text: "again" });
+    await recorder.until((e) => e.type === "turn.completed" && e.ok === true);
+    expect(await instance.snapshot()).toMatchObject({ state: "available" });
+  }, 20_000);
+
+  it("never sends a turn again when a refusal follows streamed text", async () => {
+    const state = join(scratch, "refused-launches-partial");
+    process.env.FAKE_CLAUDE_REFUSED_RESULTS = "9";
+    process.env.FAKE_CLAUDE_PARTIAL_FAILS = "1";
+    process.env.FAKE_CLAUDE_STATE = state;
+    process.env.FAKE_CLAUDE_RETRY_SCALE = "0.01";
+    await create();
+    await instance.adapter.sendTurn({ threadId: "t-refused-partial", text: "go" });
+
+    expect(await recorder.until((e) => e.type === "turn.completed")).toMatchObject({ ok: false });
+    expect(recorder.events.some((e) => e.type === "turn.retrying")).toBe(false);
+    expect(readFileSync(state, "utf8")).toBe("1");
+  }, 20_000);
+
+  it("keeps loopback off any proxy a CLI was given, with no own-MCP URL form in play", async () => {
+    directRoute();
+    vi.stubEnv(OWN_MCP_HTTP_ENV, undefined);
+    const dump = join(scratch, "loopback-proxy.json");
+    process.env.FAKE_CLAUDE_DUMP = dump;
+    await create(undefined, { HTTPS_PROXY: "http://127.0.0.1:9", NO_PROXY: "example.com" });
+    // Windows keeps one spelling of an environment name, so the CLI sees NO_PROXY or no_proxy there, never both.
+    const noProxy = () => {
+      const { env }: { env: Record<string, string> } = JSON.parse(readFileSync(dump, "utf8"));
+      return Object.entries(env).filter(([name]) => name.toLowerCase() === "no_proxy").map(([, value]) => value.split(","));
+    };
+
+    await instance.adapter.sendTurn({ threadId: "t-loopback", text: "go" });
+    await recorder.until((e) => e.type === "turn.completed");
+    const turn = noProxy();
+    await instance.generateText!("ping"); // a helper call shares the environment; its capture replaces the turn's
+    const helper = noProxy();
+
+    expect(turn.length).toBeGreaterThan(0);
+    expect(helper.length).toBeGreaterThan(0);
+    for (const hosts of [...turn, ...helper]) expect(hosts).toEqual(expect.arrayContaining(["example.com", "127.0.0.1", "localhost", "::1"]));
+  });
+
+  it("masks the credentials of a proxy URL when it reports a refused connection", async () => {
+    directRoute();
+    process.env.FAKE_CLAUDE_REFUSED_RESULTS = "9";
+    process.env.FAKE_CLAUDE_STATE = join(scratch, "refused-launches-proxy");
+    process.env.FAKE_CLAUDE_RETRY_SCALE = "0.01";
+    await create(undefined, { HTTPS_PROXY: "http://user:supersecret@proxy.corp:8080" });
+    await instance.adapter.sendTurn({ threadId: "t-refused-proxy", text: "go" });
+
+    await recorder.until((e) => e.type === "turn.completed");
+    const reported = recorder.events.filter((e) => e.type === "runtime.error").map((e) => e.message);
+    const status = (await instance.snapshot()).reason!;
+    expect(reported).toHaveLength(1);
+    for (const text of [reported[0]!, status]) {
+      expect(text).toContain("proxy.corp:8080");
+      expect(text).not.toContain("supersecret");
+    }
+  }, 20_000);
+
+  it("names the gateway a person's Claude settings point at, not the default API, as the target of a refused connection", async () => {
+    directRoute();
+    const configDir = join(scratch, "claude-config-gateway");
+    mkdirSync(configDir, { recursive: true });
+    writeFileSync(join(configDir, "settings.json"), JSON.stringify({ env: { ANTHROPIC_BASE_URL: "http://127.0.0.1:3456" } }));
+    process.env.FAKE_CLAUDE_REFUSED_RESULTS = "9";
+    process.env.FAKE_CLAUDE_STATE = join(scratch, "refused-launches-gateway");
+    process.env.FAKE_CLAUDE_RETRY_SCALE = "0.01";
+    await create(undefined, { CLAUDE_CONFIG_DIR: configDir });
+    await instance.adapter.sendTurn({ threadId: "t-refused-gateway", text: "go" });
+
+    await recorder.until((e) => e.type === "turn.completed");
+    expect(recorder.events.filter((e) => e.type === "runtime.error").map((e) => e.message))
+      .toEqual([expect.stringContaining("Target: http://127.0.0.1:3456.")]);
+  }, 20_000);
+
+  it("holds the engine unavailable after a helper call is refused, until one gets through", async () => {
+    await create(undefined, { FAKE_CLAUDE_TEXT_RESULT: JSON.stringify({ type: "result", is_error: true, result: "API Error: Connection refused \u2014 a firewall or proxy may be blocking it (ECONNREFUSED)" }) });
+    await expect(instance.generateText!("ping", { onUsage: vi.fn() })).rejects.toThrow("ECONNREFUSED");
+    expect(await instance.snapshot()).toMatchObject({ state: "unavailable", reason: expect.stringContaining("ECONNREFUSED") });
+
+    await expect(instance.generateText!("ping")).resolves.toBe("fake generated text"); // the text form never reads FAKE_CLAUDE_TEXT_RESULT
+    expect(await instance.snapshot()).toMatchObject({ state: "available" });
+  });
 
   it("an interrupt during the retry backoff cancels cleanly without a zombie relaunch", async () => {
     process.env.FAKE_CLAUDE_TRANSIENTS = "9";

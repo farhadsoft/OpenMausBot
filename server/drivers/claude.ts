@@ -132,7 +132,28 @@ function claudeEnvironment(
   const applied = applyClaudeInject(env, model);
   // An inherited ANTHROPIC_API_KEY would flip a subscription login to pay-as-you-go.
   if (!applied.injected && !instanceEnvironment.ANTHROPIC_API_KEY) delete env.ANTHROPIC_API_KEY;
+  // Loopback is never proxied: with a system proxy set, the CLI's calls to a local endpoint or OpenMausBot's own MCP URLs would ride it and fail ECONNREFUSED.
+  withLoopbackNoProxy(env);
   return env;
+}
+
+/** A connection the CLI could not make, with what places it: where it was calling and the proxy settings it ran with. The
+ * refusal's own words stay first (retry.ts and the chat's plain-error reader classify by them); credentials in a proxy or
+ * endpoint URL are masked. `settingsEnv` is the `env` of the --settings file the turn passed: the CLI applies it over its
+ * own environment, so a gateway the person set in their Claude settings is the target, not the default API. */
+function connectionFailureMessage(reason: string, processEnv: NodeJS.ProcessEnv, settingsEnv?: unknown): string {
+  const env: NodeJS.ProcessEnv = { ...processEnv };
+  if (typeof settingsEnv === "object" && settingsEnv !== null) {
+    for (const [key, value] of Object.entries(settingsEnv)) if (typeof value === "string") env[key] = value;
+  }
+  const target = env.CLAUDE_CODE_USE_BEDROCK === "1" ? "AWS Bedrock"
+    : env.CLAUDE_CODE_USE_VERTEX === "1" ? "Google Vertex"
+    : env.ANTHROPIC_BASE_URL?.trim() || "https://api.anthropic.com";
+  const proxies = ["HTTP_PROXY", "HTTPS_PROXY", "ALL_PROXY", "http_proxy", "https_proxy", "all_proxy"]
+    .filter((key) => env[key]?.trim()).map((key) => `${key}=${env[key]!.trim()}`);
+  const noProxy = (env.NO_PROXY ?? env.no_proxy)?.trim();
+  const proxy = proxies.length ? `Proxy: ${proxies.join(", ")}.${noProxy ? ` NO_PROXY=${noProxy}.` : ""}` : "No proxy set.";
+  return redactSecretsInText(`${reason.replace(/\s+/g, " ").trim()} Target: ${target}. ${proxy}`);
 }
 
 /** Escape hatch: the bot inherits this machine's Claude Code setup (MCP servers, connectors,
@@ -833,6 +854,8 @@ export const ClaudeDriver: ProviderDriver<ClaudeConfig> = {
       sawInit: boolean;
       /** why the CLI refused `--resume` with an error result instead of exiting, for the log line */
       resumeRefusal?: string;
+      /** a connection refusal an error frame carried: the close that follows sends the turn again or reports it with where the CLI was calling */
+      transportRefusal?: string;
       /** the mode `init` reports: the CLI accepts `--permission-mode auto` for any model but runs
        * "default" silently where auto is unavailable (Haiku 4.5, Sonnet 4.5, an org that disabled it) */
       nativePermissionMode: string | null;
@@ -964,6 +987,8 @@ export const ClaudeDriver: ProviderDriver<ClaudeConfig> = {
       createdAt: new Date().toISOString(),
     });
     const retryState = new Map<string, { attempt: number; cancelled: boolean; rebuilt?: boolean }>();
+    /** What the last turn or one-shot call that could not reach its API said, with where it was calling; `snapshot` reports it until a call gets through. */
+    let transportFailure: string | null = null;
 
     const sendTurn = async (turn: SendTurnInput, logicalTurnId?: string) => {
       if (startupModelRefresh) await startupModelRefresh;
@@ -1121,7 +1146,7 @@ export const ClaudeDriver: ProviderDriver<ClaudeConfig> = {
         if (gated) mcpServers[name] = { ...gated, ...((mcpServers[name] as { alwaysLoad?: unknown })?.alwaysLoad === true ? { alwaysLoad: true } : {}) };
       }
       allowed.splice(0, allowed.length, ...allowed.filter((name) => Object.hasOwn(mcpServers, name.slice("mcp__".length).split("__")[0]!)));
-      const ownHttp = claudeOwnMcpOverHttp(mcpServers); // OpenMausBot's own servers by URL where that setting is on: no proxy process each
+      claudeOwnMcpOverHttp(mcpServers); // OpenMausBot's own servers by URL where that setting is on: no proxy process each
       // Full access keeps ask_user: native bypass skips permission prompts, not questions.
       let broker: Awaited<ReturnType<typeof createPermissionBroker>> | undefined;
       const socketPath = permissionSocketPath(threadId, botId);
@@ -1133,7 +1158,7 @@ export const ClaudeDriver: ProviderDriver<ClaudeConfig> = {
       allowed.push("mcp__ogb", ...gateQueryTools(mcpServers));
       // A guest pre-allows only harness tools; anything else (the browser can open file:) asks.
       if (turn.guestConfined) allowed.splice(0, allowed.length, ...allowed.filter((name) => name === "mcp__ogb" || name === "mcp__agents"));
-      const env = withEndpointFolder(environment(config.endpointModels ? undefined : turnModel), config, () => retryState.delete(threadId)); if (ownHttp) withLoopbackNoProxy(env); env.PATH = turnEnvironment.PATH; // launch the copy this turn checked, not one a newer PATH finds
+      const env = withEndpointFolder(environment(config.endpointModels ? undefined : turnModel), config, () => retryState.delete(threadId)); env.PATH = turnEnvironment.PATH; // launch the copy this turn checked, not one a newer PATH finds
       // The MCP config carries credentials and argv is readable via `ps`: a 0600 file, removed at settle.
       let mcpConfigPath: string | null = null;
       if (Object.keys(mcpServers).length) {
@@ -1368,6 +1393,8 @@ export const ClaudeDriver: ProviderDriver<ClaudeConfig> = {
         const t = session.turn;
         if (!t || t.settled) return;
         t.settled = true;
+        session.transportRefusal = undefined; // a later turn's close must not read this one's
+        if (ok) transportFailure = null; // the API answered: ready again
         if (t.continuationGrace) {
           clearTimeout(t.continuationGrace);
           t.continuationGrace = null;
@@ -1517,6 +1544,12 @@ export const ClaudeDriver: ProviderDriver<ClaudeConfig> = {
               break;
             }
             if ((o.is_api_error_message === true || typeof o.error === "string") && text.trim()) {
+              // The turn's own refused connection is the result frame's to retry, or to report once with where the CLI was calling:
+              // not announced here, since the CLI may yet recover and a retry would show the same refusal twice. A subagent's keeps its row.
+              if (session.turn && !o.parent_tool_use_id && classifyError({ text }).reason === "connection_reset") {
+                session.transportRefusal = text;
+                break;
+              }
               if (session.turn) session.turn.explained = true;
               if (!session.turn?.stopRequested) emit({ ...base(threadId, currentTurnId()), type: "runtime.error", ...withBedrockCredentialError(config.bedrock, input.environment, text, claudeApiError(o, text)) });
               break;
@@ -1591,6 +1624,17 @@ export const ClaudeDriver: ProviderDriver<ClaudeConfig> = {
             }
             if (o.is_error === true && !session.turn?.authFailed && (session.turn?.limit ||
                 o.api_error === "usage_limit_reached" || USAGE_LIMIT.test(String(o.result ?? "")))) reachLimit(o, o.result);
+            // A refused connection on a plain turn (no steer or held result riding on it): end this CLI so its close sends the turn
+            // again on a fresh process (retry.ts decides), or reports the refusal once. A kept process would stay in the same state.
+            if (o.is_error === true && session.turn && !session.turn.settled && !session.turn.stopRequested && !session.turn.authFailed &&
+                !session.turn.limitReached && !session.turn.deferred && session.turn.pendingSteers.size === 0) {
+              const refusal = claudeResultError(o);
+              if (classifyError({ text: refusal }).reason === "connection_reset") {
+                session.transportRefusal = refusal;
+                closeSession(threadId, "connection refused");
+                break;
+              }
+            }
             if (o.is_error === true && session.turn && !session.turn.settled && !session.turn.explained && !session.turn.stopRequested) {
               session.turn.explained = true; session.turn.authFailed = claudeOAuthExpired(String(o.result ?? ""));
               emit({ ...base(threadId, currentTurnId()), type: "runtime.error", message: bedrockResultError(config.bedrock, input.environment, claudeResultError(o)), ...(session.turn.authFailed ? { setup: true } : {}) });
@@ -1715,10 +1759,14 @@ export const ClaudeDriver: ProviderDriver<ClaudeConfig> = {
           const refusedAutocompact = session.passedAutocompact && !session.sawInit && /unknown option '--autocompact'/.test(session.stderr);
           if (refusedAutocompact) { if (session.cliVersion !== null) autocompactRefusedBy.add(session.cliVersion); if (session.cliVersion === cliHelpVersion) cliHasAutocompact = false; }
           const retry = retryState.get(threadId) ?? { attempt: 0, cancelled: false };
-          const message = `claude exited ${code} before result${session.stderr ? `: ${session.stderr.trim().slice(-300)}` : ""}`;
-          const verdict = classifyError({ exitCode: code, stderr: message });
+          // A refusal recorded off an error frame ended this CLI on purpose: its own words are the failure, and its exit code (0
+          // after stdin EOF) says nothing about the turn.
+          const refused = session.transportRefusal;
+          const exitCode = refused === undefined ? code : null;
+          const message = refused ?? `claude exited ${code} before result${session.stderr ? `: ${session.stderr.trim().slice(-300)}` : ""}`;
+          const verdict = classifyError({ exitCode, stderr: message });
           const endedBeforeTurn = session.turn.awaitingInit === true || (refusedAutocompact && !session.turn.sawStreamDelta && session.turn.answered !== true);
-          if (!retry.cancelled && !stoppedForRoom(threadId, session.child.pid) && mayResendTurn({ endedBeforeTurn, exitCode: code, transient: verdict.transient,
+          if (!retry.cancelled && !stoppedForRoom(threadId, session.child.pid) && mayResendTurn({ endedBeforeTurn, exitCode, transient: verdict.transient,
             streamed: session.turn.sawStreamDelta, answered: session.turn.answered === true, attempt: retry.attempt })) {
             // `active` stays: an interrupt during the backoff reaches stop() and cancels the retry.
             const failedBroker = session.broker;
@@ -1816,10 +1864,14 @@ export const ClaudeDriver: ProviderDriver<ClaudeConfig> = {
             return;
           }
           retryState.delete(threadId);
+          // Retries spent, blocked or unwarranted: the one place a connection failure is reported, with where the CLI was calling.
+          const connection = verdict.reason === "connection_reset";
+          const reported = connection ? connectionFailureMessage(message, env, settings.env) : message;
+          if (connection) transportFailure = reported;
           emit({
             ...base(threadId, currentTurnId()),
             type: "runtime.error",
-            message,
+            message: reported,
           });
           settle(false, "exit_before_result");
         }
@@ -1897,6 +1949,7 @@ export const ClaudeDriver: ProviderDriver<ClaudeConfig> = {
       if (config.requireApiKey && !input.environment.ANTHROPIC_API_KEY) return { state: "unavailable", version, reason: NO_ANTHROPIC_KEY };
       const probed: typeof lastAuth = config.requireApiKey ? { authenticated: true } : await claudeAuthStatus(config.cli, env);
       const auth = probed.authenticated === undefined ? lastAuth : (lastAuth = probed);
+      if (transportFailure !== null) return { state: "unavailable", version, reason: transportFailure };
       return { state: "available", version, ...auth, ...claudeBilling(env, auth.account), ...(update ? { update } : {}), ...(warning ? { warning } : {}) };
     };
 
@@ -1921,8 +1974,13 @@ export const ClaudeDriver: ProviderDriver<ClaudeConfig> = {
           clearTimeout(timer);
           signal?.removeEventListener("abort", onAbort);
           removeCwd();
-          if (error) reject(error);
-          else resolve(stdout.trim());
+          if (error) {
+            if (classifyError({ text: error.message }).reason === "connection_reset") transportFailure = connectionFailureMessage(error.message, env);
+            reject(error);
+          } else {
+            transportFailure = null;
+            resolve(stdout.trim());
+          }
         };
         const onAbort = () => {
           killCliTree(child);
