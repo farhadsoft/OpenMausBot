@@ -4,7 +4,7 @@
 // installed binary or the checksummed official release asset.
 import { createHash } from "node:crypto";
 import { copyFile, mkdir, readFile, rm, stat, chmod, writeFile } from "node:fs/promises";
-import { existsSync, realpathSync } from "node:fs";
+import { existsSync, realpathSync, statSync } from "node:fs";
 import { execFile } from "node:child_process";
 import { dirname, join } from "node:path";
 import { fileURLToPath } from "node:url";
@@ -12,9 +12,11 @@ import { promisify } from "node:util";
 import { build } from "esbuild";
 import { resolveCuaMacArches } from "./cua-mac-arches.mjs";
 import { LIPO_ARCH, writeThinMachO } from "./mac-thin.mjs";
-import { CUA_MIN_MACOS } from "../electron/cua-min-macos.mjs";
+import { CUA_MIN_MACOS, macDriverKind } from "../electron/cua-min-macos.mjs";
 
 if (process.platform !== "darwin") throw new Error("prepare-cua is macOS-only");
+// macOS 12.3–14 cannot execute the pinned driver (its SDK needs 15), but must still stage it for macOS 15+ machines.
+const canRunCua = macDriverKind() !== "legacy";
 
 const root = join(dirname(fileURLToPath(import.meta.url)), "..");
 const run = promisify(execFile);
@@ -48,6 +50,10 @@ async function binaryVersion(candidate) {
 async function officialBinary() {
   const cache = join(root, "node_modules", ".cache", "openmausbot", `cua-driver-${release.version}`);
   const cachedBinary = join(cache, "cua-driver");
+  if (!canRunCua && existsSync(cachedBinary)) {
+    // Only a checksum-verified download ever lands here.
+    return cachedBinary;
+  }
   if ((await binaryVersion(cachedBinary)) === expectedVersion) return cachedBinary;
 
   await rm(cache, { recursive: true, force: true });
@@ -65,7 +71,7 @@ async function officialBinary() {
   await writeFile(archive, bytes);
   await run("/usr/bin/tar", ["-xzf", archive, "-C", cache, "cua-driver"]);
   await chmod(cachedBinary, 0o755);
-  if ((await binaryVersion(cachedBinary)) !== expectedVersion) {
+  if (canRunCua && (await binaryVersion(cachedBinary)) !== expectedVersion) {
     throw new Error(`downloaded CUA Driver does not report version ${expectedVersion}`);
   }
   return cachedBinary;
@@ -73,13 +79,19 @@ async function officialBinary() {
 
 let binary;
 if (process.env.CUA_DRIVER_PATH) {
-  const suppliedVersion = await binaryVersion(process.env.CUA_DRIVER_PATH);
-  if (suppliedVersion !== expectedVersion) {
-    throw new Error(
-      `CUA_DRIVER_PATH must point to cua-driver ${expectedVersion}; found ${suppliedVersion ?? "an unreadable binary"}`,
-    );
-  }
   binary = process.env.CUA_DRIVER_PATH;
+  if (!canRunCua) {
+    if (!existsSync(binary) || (statSync(binary).mode & 0o111) === 0) {
+      throw new Error(`CUA_DRIVER_PATH must point to an executable cua-driver; found ${binary}`);
+    }
+  } else {
+    const suppliedVersion = await binaryVersion(binary);
+    if (suppliedVersion !== expectedVersion) {
+      throw new Error(
+        `CUA_DRIVER_PATH must point to cua-driver ${expectedVersion}; found ${suppliedVersion ?? "an unreadable binary"}`,
+      );
+    }
+  }
 } else {
   // The locally installed app may be a single-arch build; both shipped arches
   // need it, so fall back to the official universal binary rather than fail.
